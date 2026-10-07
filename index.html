@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tilt Parallax</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: #151515; overflow: hidden; }
+  body { display: grid; place-items: center; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+  /* The stage matches your image's aspect ratio (set by script). */
+  .stage {
+    --ar: 1;
+    position: relative;
+    width: min(100vw, calc(100dvh * var(--ar)));
+    aspect-ratio: var(--ar);
+    overflow: hidden;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .layer {
+    position: absolute;
+    left: 0; top: 0; width: 100%; height: 100%;
+    object-fit: fill;
+    will-change: transform;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+
+  .ui {
+    position: absolute; left: 0; right: 0; bottom: max(16px, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    pointer-events: none;
+  }
+  button#enable {
+    pointer-events: auto;
+    font: 600 15px/1 inherit; font-family: inherit;
+    padding: 12px 20px; border-radius: 999px; border: 0;
+    background: #f2f2f2; color: #151515; cursor: pointer;
+  }
+  button#enable:focus-visible { outline: 3px solid #7fb4ff; outline-offset: 3px; }
+  .hint {
+    font-size: 13px; color: #fff; background: rgba(0,0,0,.55);
+    padding: 6px 12px; border-radius: 999px;
+    transition: opacity .6s ease;
+  }
+  .hidden { display: none !important; }
+  .fade { opacity: 0; }
+</style>
+</head>
+<body>
+
+<main class="stage" id="stage" aria-label="Layered artwork that shifts as you tilt your phone or move your mouse">
+  <div class="ui">
+    <button id="enable" class="hidden" type="button">Tap to enable tilt</button>
+    <div id="hint" class="hint hidden"></div>
+  </div>
+</main>
+
+<script>
+/* ============ EDIT THESE ============ */
+
+// List layers from BACK to FRONT. depth: 0 = barely moves, 1 = moves the most.
+const LAYERS = [
+  { src: "layer1-back.png",  depth: 0.20 },
+  { src: "layer2-far.png",   depth: 0.50 },
+  { src: "layer3-mid.png",  depth: 0.75 },
+  { src: "layer4-front.png", depth: 1.00 }
+];
+
+const MAX_SHIFT = 0.03;  // how far the front layer can move, as a fraction of image width (0.02 = subtle, 0.05 = strong)
+const TILT_RANGE = 20;   // degrees of tilt needed to reach full movement (lower = more sensitive)
+const SMOOTHING = 0.08;  // 0.04 = floaty, 0.15 = snappy
+const DIRECTION = 1;     // set to -1 if the movement feels backwards
+
+/* ============ CODE ============ */
+
+const stage = document.getElementById("stage");
+const enableBtn = document.getElementById("enable");
+const hint = document.getElementById("hint");
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+// Build the layers
+const layers = LAYERS.map((cfg, i) => {
+  const img = new Image();
+  img.className = "layer";
+  img.alt = "";
+  img.draggable = false;
+  img.src = cfg.src;
+  stage.insertBefore(img, stage.querySelector(".ui"));
+  return { el: img, depth: cfg.depth, shift: 0 };
+});
+
+// Match stage to the image's aspect ratio
+function setAspect() {
+  const first = layers[0].el;
+  if (first.naturalWidth) stage.style.setProperty("--ar", first.naturalWidth / first.naturalHeight);
+  sizeLayers();
+}
+layers[0].el.addEventListener("load", setAspect);
+if (layers[0].el.complete) setAspect();
+
+// Each layer is enlarged by exactly the distance it can travel, so no edges ever show.
+function sizeLayers() {
+  const w = stage.clientWidth;
+  const h = stage.clientHeight;
+  layers.forEach(l => {
+    l.shift = l.depth * MAX_SHIFT * w;
+    const pad = l.shift;
+    l.el.style.left = -pad + "px";
+    l.el.style.top = -pad + "px";
+    l.el.style.width = (w + pad * 2) + "px";
+    l.el.style.height = (h + pad * 2) + "px";
+  });
+}
+new ResizeObserver(sizeLayers).observe(stage);
+
+// Movement state: target (tx, ty) and smoothed current (cx, cy), both in -1..1
+let tx = 0, ty = 0, cx = 0, cy = 0;
+
+function frame() {
+  cx += (tx - cx) * SMOOTHING;
+  cy += (ty - cy) * SMOOTHING;
+  for (const l of layers) {
+    l.el.style.transform =
+      "translate3d(" + (-cx * l.shift * DIRECTION) + "px," + (-cy * l.shift * DIRECTION) + "px,0)";
+  }
+  requestAnimationFrame(frame);
+}
+if (!reduceMotion) requestAnimationFrame(frame);
+
+// ---- Mouse / pen (desktop fallback) ----
+stage.addEventListener("pointermove", e => {
+  if (e.pointerType === "touch" || reduceMotion) return;
+  const r = stage.getBoundingClientRect();
+  tx = clamp(((e.clientX - r.left) / r.width) * 2 - 1, -1, 1);
+  ty = clamp(((e.clientY - r.top) / r.height) * 2 - 1, -1, 1);
+});
+stage.addEventListener("pointerleave", e => {
+  if (e.pointerType !== "touch") { tx = 0; ty = 0; }
+});
+
+// ---- Phone tilt ----
+let base = null;      // the "neutral" holding angle, captured from the first reading
+let gotSensor = false;
+
+function onOrientation(e) {
+  if (e.gamma == null || e.beta == null || reduceMotion) return;
+  gotSensor = true;
+  if (!base) base = { g: e.gamma, b: e.beta };
+  tx = clamp((e.gamma - base.g) / TILT_RANGE, -1, 1);  // left / right
+  ty = clamp((e.beta - base.b) / TILT_RANGE, -1, 1);   // toward / away
+}
+
+function startTilt() {
+  window.addEventListener("deviceorientation", onOrientation);
+  enableBtn.classList.add("hidden");
+  showHint("Tilt your phone. Tap the image to reset.", 4000);
+  // If nothing arrives, this device has no motion sensor.
+  setTimeout(() => {
+    if (!gotSensor) showHint("No motion sensor found. Move your mouse over the image.", 4000);
+  }, 1500);
+}
+
+function showHint(text, ms) {
+  hint.textContent = text;
+  hint.classList.remove("hidden", "fade");
+  clearTimeout(showHint.t);
+  showHint.t = setTimeout(() => {
+    hint.classList.add("fade");
+    setTimeout(() => hint.classList.add("hidden"), 700);
+  }, ms);
+}
+
+// Tap the image to reset the neutral angle
+stage.addEventListener("pointerdown", e => {
+  if (e.pointerType === "touch") base = null;
+});
+
+const needsPermission =
+  typeof DeviceOrientationEvent !== "undefined" &&
+  typeof DeviceOrientationEvent.requestPermission === "function";
+
+const isTouch = matchMedia("(pointer: coarse)").matches;
+
+if (needsPermission) {
+  // iPhone / iPad: must be triggered by a tap
+  enableBtn.classList.remove("hidden");
+  enableBtn.addEventListener("click", async () => {
+    try {
+      const result = await DeviceOrientationEvent.requestPermission();
+      if (result === "granted") {
+        startTilt();
+      } else {
+        enableBtn.classList.add("hidden");
+        showHint("Motion access was denied. Reload the page to try again.", 5000);
+      }
+    } catch (err) {
+      showHint("Couldn't enable tilt on this page.", 4000);
+    }
+  });
+} else if (isTouch && "DeviceOrientationEvent" in window) {
+  // Android and most others: no permission prompt needed
+  startTilt();
+} else {
+  showHint("Move your mouse over the image.", 3500);
+}
+</script>
+</body>
+</html>
