@@ -48,25 +48,70 @@
   }
   .hidden { display: none !important; }
   .fade { opacity: 0; }
+
+  /* ---- Shake popup ---- */
+  .popup {
+    position: fixed; z-index: 10;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+    width: min(80vw, 320px);
+    box-sizing: border-box;
+    padding: 22px 22px 20px;
+    border-radius: 18px;
+    background: rgba(24, 24, 24, .88);
+    -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+    border: 1px solid rgba(255,255,255,.14);
+    box-shadow: 0 18px 50px rgba(0,0,0,.55);
+    color: #fff; text-align: center;
+  }
+  .popup:not(.hidden) { animation: pop .38s cubic-bezier(.2,1.3,.4,1) both; }
+  @keyframes pop {
+    from { opacity: 0; transform: translate(-50%, -46%) scale(.88); }
+    to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  }
+  .popup-kicker { margin: 0 0 4px; font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: #9aa0a6; }
+  .popup h2 { margin: 0 0 16px; font-size: 22px; line-height: 1.2; }
+  .popup a.go {
+    display: inline-block; padding: 12px 20px; border-radius: 999px;
+    background: #f2f2f2; color: #151515; font-weight: 600; font-size: 15px;
+    text-decoration: none;
+  }
+  .popup a.go:focus-visible, .popup-close:focus-visible { outline: 3px solid #7fb4ff; outline-offset: 3px; }
+  .popup-close {
+    position: absolute; top: 6px; right: 6px;
+    width: 44px; height: 44px; border: 0; border-radius: 50%;
+    background: transparent; color: #cfcfcf; font-size: 26px; line-height: 1; cursor: pointer;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .popup:not(.hidden) { animation: none; }
+  }
 </style>
 </head>
 <body>
 
-<main class="stage" id="stage" aria-label="Layered artwork that shifts as you tilt your phone or move your mouse">
+<main class="stage" id="stage" aria-label="Layered artwork that shifts as you tilt your phone or move your mouse. Tap to sway the foliage.">
   <div class="ui">
     <button id="enable" class="hidden" type="button">Tap to enable tilt</button>
     <div id="hint" class="hint hidden"></div>
   </div>
 </main>
 
+<div id="popup" class="popup hidden" role="dialog" aria-labelledby="popup-title">
+  <button id="popup-close" class="popup-close" type="button" aria-label="Close">&times;</button>
+  <p class="popup-kicker">You shook it loose</p>
+  <h2 id="popup-title">Tokyo Dope City</h2>
+  <a id="popup-link" class="go" href="https://tokyodopecity.com/" target="_blank" rel="noopener noreferrer">Visit tokyodopecity.com ↗</a>
+</div>
+
 <script>
 /* ============ EDIT THESE ============ */
 
 // List layers from BACK to FRONT. depth: 0 = barely moves, 1 = moves the most.
+// sway: true = this layer sways when the screen is tapped.
 const LAYERS = [
   { src: "layer1-back.png",  depth: 0.20 },
-  { src: "layer2-far.png",   depth: 0.50 },
-  { src: "layer3-mid.png",  depth: 0.75 },
+  { src: "layer2-far.png",   depth: 0.50, title: true },
+  { src: "layer3-mid.png",   depth: 0.75, sway: true },
   { src: "layer4-front.png", depth: 1.00 }
 ];
 
@@ -75,14 +120,50 @@ const TILT_RANGE = 20;   // degrees of tilt needed to reach full movement (lower
 const SMOOTHING = 0.08;  // 0.04 = floaty, 0.15 = snappy
 const DIRECTION = 1;     // set to -1 if the movement feels backwards
 
+// Foliage sway (tap)
+const SWAY_ANGLE = 1.4;        // max rotation in degrees (0.8 = very subtle, 3 = big)
+const SWAY_SKEW = 1.0;         // extra bend in degrees, makes it feel less stiff
+const SWAY_DURATION = 2600;    // milliseconds until it settles
+const SWAY_CYCLES = 2.5;       // number of back-and-forth swings
+const SWAY_ORIGIN = "50% 100%"; // pivot point of the sway ("50% 100%" = bottom center)
+
+// Shake popup
+const POPUP_URL = "https://tokyodopecity.com/";
+const SHAKE_THRESHOLD = 25;    // how hard each jolt must be (lower = easier to trigger)
+const SHAKE_HITS = 4;          // jolts needed...
+const SHAKE_WINDOW = 900;      // ...within this many milliseconds
+const SHAKE_COOLDOWN = 2500;   // ms before it can trigger again
+
+// Title effect: a light glint that melts into a color split as you tilt further.
+// Ranges are "how far you've tilted", from 0 (neutral) to 1 (full tilt).
+const TITLE_FX = {
+  glintIn:  [0.05, 0.25],  // glint fades in over this range
+  glintOut: [0.40, 0.80],  // glint fades out over this range
+  splitIn:  [0.40, 1.00],  // color split grows over this range
+  glintBrightness: 2.6,    // how much the glint brightens the letters (1.5 = soft, 3.5 = blazing)
+  glintWidth: 0.10,        // width of the glint band, as a fraction of the image width
+  splitMax: 0.012,         // biggest color-split offset, as a fraction of the image width
+  colorA: "rgba(255, 40, 80, 0.9)",   // ghost on the side you tilt toward
+  colorB: "rgba(40, 220, 255, 0.9)"   // ghost on the opposite side
+};
+
 /* ============ CODE ============ */
 
 const stage = document.getElementById("stage");
 const enableBtn = document.getElementById("enable");
 const hint = document.getElementById("hint");
+const popup = document.getElementById("popup");
+const popupClose = document.getElementById("popup-close");
+const popupLink = document.getElementById("popup-link");
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const smooth = (range, v) => {
+  const t = clamp((v - range[0]) / (range[1] - range[0]), 0, 1);
+  return t * t * (3 - 2 * t);
+};
+
+popupLink.href = POPUP_URL;
 
 // Build the layers
 const layers = LAYERS.map((cfg, i) => {
@@ -91,8 +172,29 @@ const layers = LAYERS.map((cfg, i) => {
   img.alt = "";
   img.draggable = false;
   img.src = cfg.src;
+  if (cfg.sway) img.style.transformOrigin = SWAY_ORIGIN;
   stage.insertBefore(img, stage.querySelector(".ui"));
-  return { el: img, depth: cfg.depth, shift: 0 };
+
+  // Title layer gets a second, brightened copy on top, revealed through a moving band (the glint)
+  let glint = null;
+  if (cfg.title) {
+    glint = new Image();
+    glint.className = "layer";
+    glint.alt = "";
+    glint.draggable = false;
+    glint.src = cfg.src;
+    glint.style.opacity = "0";
+    glint.style.filter = "brightness(" + TITLE_FX.glintBrightness + ")";
+    const half = TITLE_FX.glintWidth / 3 / 2 * 100; // band is drawn on a mask 3x the layer width
+    const band = "linear-gradient(100deg, transparent " + (50 - half) + "%, #000 50%, transparent " + (50 + half) + "%)";
+    glint.style.webkitMaskImage = band;
+    glint.style.maskImage = band;
+    glint.style.webkitMaskRepeat = "no-repeat";
+    glint.style.maskRepeat = "no-repeat";
+    stage.insertBefore(glint, stage.querySelector(".ui"));
+  }
+
+  return { el: img, depth: cfg.depth, shift: 0, w: 0, sway: !!cfg.sway, title: !!cfg.title, glint: glint };
 });
 
 // Match stage to the image's aspect ratio
@@ -111,10 +213,19 @@ function sizeLayers() {
   layers.forEach(l => {
     l.shift = l.depth * MAX_SHIFT * w;
     const pad = l.shift;
-    l.el.style.left = -pad + "px";
-    l.el.style.top = -pad + "px";
-    l.el.style.width = (w + pad * 2) + "px";
-    l.el.style.height = (h + pad * 2) + "px";
+    l.w = w + pad * 2;
+    [l.el, l.glint].forEach(el => {
+      if (!el) return;
+      el.style.left = -pad + "px";
+      el.style.top = -pad + "px";
+      el.style.width = l.w + "px";
+      el.style.height = (h + pad * 2) + "px";
+    });
+    if (l.glint) {
+      const size = (l.w * 3) + "px 100%";
+      l.glint.style.webkitMaskSize = size;
+      l.glint.style.maskSize = size;
+    }
   });
 }
 new ResizeObserver(sizeLayers).observe(stage);
@@ -122,12 +233,65 @@ new ResizeObserver(sizeLayers).observe(stage);
 // Movement state: target (tx, ty) and smoothed current (cx, cy), both in -1..1
 let tx = 0, ty = 0, cx = 0, cy = 0;
 
-function frame() {
+// Sway state
+let swayStart = null;
+let swayDir = 1;
+
+function triggerSway() {
+  if (reduceMotion) return;
+  swayStart = performance.now();
+  swayDir = Math.random() < 0.5 ? -1 : 1; // lean a different way each tap
+}
+
+function frame(now) {
   cx += (tx - cx) * SMOOTHING;
   cy += (ty - cy) * SMOOTHING;
+
+  // Sway: a quick start, then a swing that fades out smoothly
+  let swayTransform = "";
+  if (swayStart !== null) {
+    const t = (now - swayStart) / SWAY_DURATION;
+    if (t >= 1) {
+      swayStart = null;
+    } else {
+      const env = (1 - t) * (1 - t) * Math.min(1, t * 10);
+      const osc = Math.sin(t * SWAY_CYCLES * Math.PI * 2) * env * swayDir;
+      swayTransform = " rotate(" + (osc * SWAY_ANGLE) + "deg) skewX(" + (osc * SWAY_SKEW) + "deg)";
+    }
+  }
+
+  // Title effect amounts: glint rises and falls, color split takes over as tilt grows
+  const mag = Math.min(1, Math.hypot(cx, cy));
+  const glintAmt = smooth(TITLE_FX.glintIn, mag) * (1 - smooth(TITLE_FX.glintOut, mag));
+  const splitAmt = smooth(TITLE_FX.splitIn, mag);
+
   for (const l of layers) {
-    l.el.style.transform =
-      "translate3d(" + (-cx * l.shift * DIRECTION) + "px," + (-cy * l.shift * DIRECTION) + "px,0)";
+    const t =
+      "translate3d(" + (-cx * l.shift * DIRECTION) + "px," + (-cy * l.shift * DIRECTION) + "px,0)" +
+      (l.sway ? swayTransform : "");
+    l.el.style.transform = t;
+
+    if (l.title) {
+      const g = l.glint;
+      g.style.transform = t;
+      g.style.opacity = glintAmt;
+
+      // The glint band sweeps across the letters as you tilt left / right
+      const pos = ((0.5 + cx * 0.6) - 1.5) * l.w + "px 0px";
+      g.style.webkitMaskPosition = pos;
+      g.style.maskPosition = pos;
+
+      // Color split: two tinted ghosts slide out from behind the title in opposite directions
+      const k = splitAmt * TITLE_FX.splitMax * l.w;
+      if (k > 0.05) {
+        const ox = (cx * k).toFixed(2), oy = (cy * k).toFixed(2);
+        l.el.style.filter =
+          "drop-shadow(" + ox + "px " + oy + "px 0 " + TITLE_FX.colorA + ") " +
+          "drop-shadow(" + (-ox) + "px " + (-oy) + "px 0 " + TITLE_FX.colorB + ")";
+      } else {
+        l.el.style.filter = "none";
+      }
+    }
   }
   requestAnimationFrame(frame);
 }
@@ -156,10 +320,35 @@ function onOrientation(e) {
   ty = clamp((e.beta - base.b) / TILT_RANGE, -1, 1);   // toward / away
 }
 
+// ---- Shake detection ----
+let lastAccel = null;
+let shakeHits = [];
+let lastShake = 0;
+
+function onMotion(e) {
+  const a = e.accelerationIncludingGravity;
+  if (!a || a.x == null || a.y == null || a.z == null) return;
+  if (lastAccel) {
+    const jolt = Math.abs(a.x - lastAccel.x) + Math.abs(a.y - lastAccel.y) + Math.abs(a.z - lastAccel.z);
+    if (jolt > SHAKE_THRESHOLD) {
+      const now = Date.now();
+      shakeHits.push(now);
+      shakeHits = shakeHits.filter(t => now - t < SHAKE_WINDOW);
+      if (shakeHits.length >= SHAKE_HITS && now - lastShake > SHAKE_COOLDOWN) {
+        lastShake = now;
+        shakeHits = [];
+        openPopup();
+      }
+    }
+  }
+  lastAccel = { x: a.x, y: a.y, z: a.z };
+}
+
 function startTilt() {
   window.addEventListener("deviceorientation", onOrientation);
+  window.addEventListener("devicemotion", onMotion);
   enableBtn.classList.add("hidden");
-  showHint("Tilt your phone. Tap the image to reset.", 4000);
+  showHint("Tilt your phone. Tap to sway the leaves. Shake for a surprise.", 5000);
   // If nothing arrives, this device has no motion sensor.
   setTimeout(() => {
     if (!gotSensor) showHint("No motion sensor found. Move your mouse over the image.", 4000);
@@ -176,9 +365,34 @@ function showHint(text, ms) {
   }, ms);
 }
 
-// Tap the image to reset the neutral angle
+// ---- Popup ----
+function openPopup() {
+  if (!popup.classList.contains("hidden")) return;
+  popup.classList.remove("hidden");
+  popupLink.focus({ preventScroll: true });
+  if (navigator.vibrate) navigator.vibrate(40);
+}
+function closePopup() {
+  popup.classList.add("hidden");
+}
+popupClose.addEventListener("click", closePopup);
+popupLink.addEventListener("click", () => setTimeout(closePopup, 150));
+window.addEventListener("keydown", e => {
+  if (e.key === "Escape") closePopup();
+  if ((e.key === "s" || e.key === "S") && !e.metaKey && !e.ctrlKey) openPopup(); // desktop test shortcut
+});
+
+// ---- Tap: sway the foliage. Double-tap: reset the neutral tilt angle ----
+let lastTap = 0;
 stage.addEventListener("pointerdown", e => {
-  if (e.pointerType === "touch") base = null;
+  if (e.target.closest("button")) return;
+  triggerSway();
+  const now = Date.now();
+  if (e.pointerType === "touch" && now - lastTap < 300) {
+    base = null;
+    showHint("Tilt reset to your current angle.", 1800);
+  }
+  lastTap = now;
 });
 
 const needsPermission =
@@ -194,20 +408,24 @@ if (needsPermission) {
     try {
       const result = await DeviceOrientationEvent.requestPermission();
       if (result === "granted") {
+        // Shake uses the motion sensor; on iOS this is normally granted together with orientation.
+        if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+          try { await DeviceMotionEvent.requestPermission(); } catch (_) {}
+        }
         startTilt();
       } else {
         enableBtn.classList.add("hidden");
         showHint("Motion access was denied. Reload the page to try again.", 5000);
       }
     } catch (err) {
-      showHint("Couldn't enable tilt on this page.", 4000);
+      showHint("Couldn’t enable tilt on this page.", 4000);
     }
   });
 } else if (isTouch && "DeviceOrientationEvent" in window) {
   // Android and most others: no permission prompt needed
   startTilt();
 } else {
-  showHint("Move your mouse over the image.", 3500);
+  showHint("Move your mouse over the image. Click to sway the leaves.", 4000);
 }
 </script>
 </body>
