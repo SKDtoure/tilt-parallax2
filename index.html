@@ -109,10 +109,12 @@
 // List layers from BACK to FRONT. depth: 0 = barely moves, 1 = moves the most.
 // sway: true = this layer sways when the screen is tapped.
 const LAYERS = [
-  { src: "layer1-back.png",  depth: 0.20 },
-  { src: "layer2-far.png",   depth: 0.50, title: true },
-  { src: "layer3-mid.png",   depth: 0.75, sway: true },
-  { src: "layer4-front.png", depth: 1.00 }
+  { src: "layer1-back.png",   depth: 0.20 },
+  { src: "layer1_5-back.png", depth: 0.35, spin: true },   // spin: true = rotates on long press
+  { src: "layer2-far.png",    depth: 0.50, title: true },
+  { src: "layer3-mid.png",    depth: 0.75, sway: true },
+  { src: "layer4-front-plain.png", depth: 1.00 },          // sits underneath, always visible
+  { src: "layer4-front.png",  depth: 1.00, pulse: true }   // pulse: true = fades in and out over the plain one
 ];
 
 const MAX_SHIFT = 0.03;  // how far the front layer can move, as a fraction of image width (0.02 = subtle, 0.05 = strong)
@@ -146,6 +148,22 @@ const TITLE_FX = {
   colorA: "rgba(255, 40, 80, 0.9)",   // ghost on the side you tilt toward
   colorB: "rgba(40, 220, 255, 0.9)"   // ghost on the opposite side
 };
+
+// Spinning circle (press and hold anywhere on the image)
+const SPIN_CENTER = { x: 0.5, y: 0.5 }; // center of the circle in layer1_5-back.png, as a fraction of the image (0 to 1)
+const LONG_PRESS_MS = 450;   // how long to hold before it starts spinning
+const SPIN_SPEED = 220;      // degrees per second at full speed
+const SPIN_RAMP = 0.05;      // how quickly it speeds up (higher = snappier)
+const SPIN_FRICTION = 0.98;  // how it slows after you let go (closer to 1 = longer glide)
+
+// Backlight pulse (layer4-front.png fading over layer4-front-plain.png at random)
+const PULSE_MIN = 120;       // shortest wait before the light changes, in ms
+const PULSE_MAX = 900;       // longest wait, in ms
+const PULSE_DIM = 0;         // how dim the "off" state is (0 = fully plain, 0.3 = never fully off)
+const PULSE_SMOOTH = 0.2;    // 0.05 = slow glow, 1 = hard flicker
+
+// Shake sound (plays from "start" to "end", in seconds)
+const SHAKE_SOUND = { src: "WE GOT BEETS.mp3", start: 3, end: 5, volume: 1 };
 
 /* ============ CODE ============ */
 
@@ -194,7 +212,7 @@ const layers = LAYERS.map((cfg, i) => {
     stage.insertBefore(glint, stage.querySelector(".ui"));
   }
 
-  return { el: img, depth: cfg.depth, shift: 0, w: 0, sway: !!cfg.sway, title: !!cfg.title, glint: glint };
+  return { el: img, depth: cfg.depth, shift: 0, w: 0, sway: !!cfg.sway, title: !!cfg.title, glint: glint, spin: !!cfg.spin, pulse: !!cfg.pulse };
 });
 
 // Match stage to the image's aspect ratio
@@ -214,6 +232,10 @@ function sizeLayers() {
     l.shift = l.depth * MAX_SHIFT * w;
     const pad = l.shift;
     l.w = w + pad * 2;
+    if (l.spin) {
+      // pivot on the circle's own center so it spins in place
+      l.el.style.transformOrigin = (pad + SPIN_CENTER.x * w) + "px " + (pad + SPIN_CENTER.y * h) + "px";
+    }
     [l.el, l.glint].forEach(el => {
       if (!el) return;
       el.style.left = -pad + "px";
@@ -237,6 +259,16 @@ let tx = 0, ty = 0, cx = 0, cy = 0;
 let swayStart = null;
 let swayDir = 1;
 
+// Spin state (long press)
+let spinning = false;
+let spinVel = 0;     // degrees per second
+let spinAngle = 0;
+
+// Backlight pulse state
+let pulseTarget = 1, pulseCur = 1, pulseNext = 0;
+
+let lastT = 0;
+
 function triggerSway() {
   if (reduceMotion) return;
   swayStart = performance.now();
@@ -244,6 +276,9 @@ function triggerSway() {
 }
 
 function frame(now) {
+  const dt = lastT ? Math.min(50, now - lastT) : 16.67;
+  lastT = now;
+  const f = dt / 16.67; // 1 at 60fps, so motion feels the same on any screen
   cx += (tx - cx) * SMOOTHING;
   cy += (ty - cy) * SMOOTHING;
 
@@ -260,6 +295,19 @@ function frame(now) {
     }
   }
 
+  // Spin: ramps up while you hold, then glides to a stop after you let go
+  if (spinning) spinVel += (SPIN_SPEED - spinVel) * (1 - Math.pow(1 - SPIN_RAMP, f));
+  else spinVel *= Math.pow(SPIN_FRICTION, f);
+  if (spinVel < 0.05) spinVel = 0;
+  spinAngle = (spinAngle + spinVel * dt / 1000) % 360;
+
+  // Backlight pulse: at random moments, pick lit or plain and ease toward it
+  if (now >= pulseNext) {
+    pulseTarget = Math.random() < 0.5 ? 1 : PULSE_DIM;
+    pulseNext = now + PULSE_MIN + Math.random() * (PULSE_MAX - PULSE_MIN);
+  }
+  pulseCur += (pulseTarget - pulseCur) * (1 - Math.pow(1 - PULSE_SMOOTH, f));
+
   // Title effect amounts: glint rises and falls, color split takes over as tilt grows
   const mag = Math.min(1, Math.hypot(cx, cy));
   const glintAmt = smooth(TITLE_FX.glintIn, mag) * (1 - smooth(TITLE_FX.glintOut, mag));
@@ -268,8 +316,10 @@ function frame(now) {
   for (const l of layers) {
     const t =
       "translate3d(" + (-cx * l.shift * DIRECTION) + "px," + (-cy * l.shift * DIRECTION) + "px,0)" +
-      (l.sway ? swayTransform : "");
+      (l.sway ? swayTransform : "") +
+      (l.spin ? " rotate(" + spinAngle + "deg)" : "");
     l.el.style.transform = t;
+    if (l.pulse) l.el.style.opacity = pulseCur;
 
     if (l.title) {
       const g = l.glint;
@@ -337,7 +387,7 @@ function onMotion(e) {
       if (shakeHits.length >= SHAKE_HITS && now - lastShake > SHAKE_COOLDOWN) {
         lastShake = now;
         shakeHits = [];
-        openPopup();
+        onShake();
       }
     }
   }
@@ -348,7 +398,7 @@ function startTilt() {
   window.addEventListener("deviceorientation", onOrientation);
   window.addEventListener("devicemotion", onMotion);
   enableBtn.classList.add("hidden");
-  showHint("Tilt your phone. Tap to sway the leaves. Shake for a surprise.", 5000);
+  showHint("Tilt your phone. Tap to sway the leaves. Hold to spin. Shake for a surprise.", 5000);
   // If nothing arrives, this device has no motion sensor.
   setTimeout(() => {
     if (!gotSensor) showHint("No motion sensor found. Move your mouse over the image.", 4000);
@@ -365,6 +415,83 @@ function showHint(text, ms) {
   }, ms);
 }
 
+// ---- Shake sound ----
+const SOUND_URL = encodeURI(SHAKE_SOUND.src);
+let audioCtx = null, audioBuf = null;
+let fallbackAudio = null, fallbackReady = false, fallbackTimer = null;
+let soundBusyUntil = 0;
+
+// Browsers only allow sound after a touch or click, so the first one quietly gets it ready.
+function unlockAudio() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!audioCtx && !fallbackAudio) {
+    if (AC && location.protocol !== "file:") {
+      // Preferred: decode once, then play the exact 3s to 5s slice
+      audioCtx = new AC();
+      fetch(SOUND_URL)
+        .then(r => r.arrayBuffer())
+        .then(buf => new Promise((ok, fail) => audioCtx.decodeAudioData(buf, ok, fail)))
+        .then(decoded => { audioBuf = decoded; })
+        .catch(() => {});
+    } else {
+      // Fallback (for example when the page is opened straight from a file)
+      fallbackAudio = new Audio(SOUND_URL);
+      fallbackAudio.preload = "auto";
+    }
+  }
+  if (audioCtx && audioCtx.state !== "running") audioCtx.resume();
+  if (fallbackAudio && !fallbackReady) {
+    fallbackAudio.muted = true;
+    const p = fallbackAudio.play();
+    if (p) p.then(() => {
+      fallbackAudio.pause();
+      fallbackAudio.muted = false;
+      fallbackReady = true;
+    }).catch(() => { fallbackAudio.muted = false; });
+  }
+}
+["pointerup", "touchend", "click", "keydown"].forEach(ev =>
+  window.addEventListener(ev, unlockAudio, { passive: true })
+);
+
+function playShakeSound() {
+  const now = performance.now();
+  const dur = SHAKE_SOUND.end - SHAKE_SOUND.start;
+  if (now < soundBusyUntil) return;
+  if (audioCtx && audioBuf) {
+    soundBusyUntil = now + dur * 1000;
+    const t0 = audioCtx.currentTime;
+    const src = audioCtx.createBufferSource();
+    const gain = audioCtx.createGain();
+    src.buffer = audioBuf;
+    // tiny fade at the end so the cut doesn't click
+    gain.gain.setValueAtTime(SHAKE_SOUND.volume, t0);
+    gain.gain.setValueAtTime(SHAKE_SOUND.volume, t0 + Math.max(0, dur - 0.08));
+    gain.gain.linearRampToValueAtTime(0, t0 + dur);
+    src.connect(gain);
+    gain.connect(audioCtx.destination);
+    src.start(t0, SHAKE_SOUND.start, dur);
+  } else if (fallbackAudio) {
+    soundBusyUntil = now + dur * 1000;
+    clearInterval(fallbackTimer);
+    fallbackAudio.volume = SHAKE_SOUND.volume;
+    fallbackAudio.currentTime = SHAKE_SOUND.start;
+    fallbackAudio.play().catch(() => {});
+    fallbackTimer = setInterval(() => {
+      if (fallbackAudio.currentTime >= SHAKE_SOUND.end) {
+        fallbackAudio.pause();
+        clearInterval(fallbackTimer);
+      }
+    }, 40);
+  }
+}
+
+// A shake opens the popup and plays the sound together
+function onShake() {
+  openPopup();
+  playShakeSound();
+}
+
 // ---- Popup ----
 function openPopup() {
   if (!popup.classList.contains("hidden")) return;
@@ -379,11 +506,12 @@ popupClose.addEventListener("click", closePopup);
 popupLink.addEventListener("click", () => setTimeout(closePopup, 150));
 window.addEventListener("keydown", e => {
   if (e.key === "Escape") closePopup();
-  if ((e.key === "s" || e.key === "S") && !e.metaKey && !e.ctrlKey) openPopup(); // desktop test shortcut
+  if ((e.key === "s" || e.key === "S") && !e.metaKey && !e.ctrlKey) onShake(); // desktop test shortcut
 });
 
-// ---- Tap: sway the foliage. Double-tap: reset the neutral tilt angle ----
+// ---- Tap: sway the foliage. Double-tap: reset tilt. Press and hold: spin the circle ----
 let lastTap = 0;
+let holdTimer = null;
 stage.addEventListener("pointerdown", e => {
   if (e.target.closest("button")) return;
   triggerSway();
@@ -393,7 +521,17 @@ stage.addEventListener("pointerdown", e => {
     showHint("Tilt reset to your current angle.", 1800);
   }
   lastTap = now;
+  clearTimeout(holdTimer);
+  holdTimer = setTimeout(() => { if (!reduceMotion) spinning = true; }, LONG_PRESS_MS);
 });
+function endHold() {
+  clearTimeout(holdTimer);
+  spinning = false;
+}
+window.addEventListener("pointerup", endHold);
+window.addEventListener("pointercancel", endHold);
+// Stop the long-press menu from popping up on phones
+stage.addEventListener("contextmenu", e => e.preventDefault());
 
 const needsPermission =
   typeof DeviceOrientationEvent !== "undefined" &&
@@ -425,7 +563,7 @@ if (needsPermission) {
   // Android and most others: no permission prompt needed
   startTilt();
 } else {
-  showHint("Move your mouse over the image. Click to sway the leaves.", 4000);
+  showHint("Move your mouse over the image. Click to sway the leaves, hold to spin.", 4500);
 }
 </script>
 </body>
